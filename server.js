@@ -8,21 +8,31 @@ const XLSX = require('xlsx');
 const cron = require('node-cron');
 
 const app = express();
-const PORT = 5000;
 
-// Настройки
+// ✅ Исправление 1: Динамический PORT
+const PORT = process.env.PORT || 5000;
+
+// ✅ Исправление 2: Убраны пробелы в URL
 const BASE_URL = 'https://www.rsatu.ru';
 const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
-const DOWNLOAD_DIR = './downloads';
 const TARGET_LINK_TEXT = 'Расписание занятий';
 
-if (!fs.existsSync(DOWNLOAD_DIR)) {
-  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-}
+// ❌ Убираем сохранение в ./downloads — Render не сохранит файлы
+// const DOWNLOAD_DIR = './downloads';
+// if (!fs.existsSync(DOWNLOAD_DIR)) {
+//   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+// }
 
 app.use(cors());
 app.use(express.json());
-app.use('/schedules', express.static(DOWNLOAD_DIR)); // Статика: можно посмотреть файлы
+
+// ✅ Исправление 3: Простой маршрут для проверки
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>🚀 Сервер расписания РГАТУ</h1>
+    <p>Готов к работе. Используй <code>POST /api/schedule</code></p>
+  `);
+});
 
 // === ПАРСИНГ ССЫЛКИ ===
 async function findScheduleLink() {
@@ -41,8 +51,19 @@ async function findScheduleLink() {
       const href = $(el).attr('href');
       if (!href) return;
 
-      const fullUrl = new URL(href, SCHEDULE_PAGE_URL).href;
-      if (text.includes(TARGET_LINK_TEXT) || text.toLowerCase().includes('расписание') || href.includes('.xlsx')) {
+      // Правильный fullUrl
+      let fullUrl;
+      try {
+        fullUrl = new URL(href, SCHEDULE_PAGE_URL).href;
+      } catch (err) {
+        return; // пропускаем битые ссылки
+      }
+
+      if (
+        text.includes(TARGET_LINK_TEXT) ||
+        text.toLowerCase().includes('расписание') ||
+        href.includes('.xlsx')
+      ) {
         links.push({ text, href, fullUrl });
       }
     });
@@ -58,36 +79,25 @@ async function findScheduleLink() {
   }
 }
 
-// === СКАЧИВАНИЕ ФАЙЛА ===
-async function downloadFile(url) {
+// === СКАЧИВАНИЕ И ОБРАБОТКА В ПАМЯТИ (без сохранения на диск) ===
+async function fetchAndParseExcel(url, targetGroup) {
   try {
     const response = await axios.get(url, {
       responseType: 'arraybuffer',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': SCHEDULE_PAGE_URL
+      }
     });
 
-    const filename = path.basename(new URL(url).pathname) || 'schedule.xlsx';
-    const filePath = path.join(DOWNLOAD_DIR, filename);
-
-    fs.writeFileSync(filePath, response.data);
-    console.log(`✅ Файл сохранён: ${filePath}`);
-    return filePath;
-  } catch (err) {
-    console.error('❌ Ошибка загрузки:', err.message);
-    throw err;
-  }
-}
-
-// === ЧТЕНИЕ И ОБРАБОТКА EXCEL ===
-function extractGroupSchedule(filePath, targetGroup) {
-  try {
-    const workbook = XLSX.readFile(filePath);
+    // ✅ Читаем Excel из памяти (без fs!)
+    const workbook = XLSX.read(response.data, { type: 'buffer' });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); // defval: "" — чтобы не было undefined
+    const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
 
     let groupColIndex = -1;
 
-    // 🔍 Поиск колонки с группой (ищем в первой части таблицы)
+    // Поиск колонки с группой
     for (let rowIdx = 0; rowIdx < Math.min(data.length, 20); rowIdx++) {
       const row = data[rowIdx] || [];
       for (let colIdx = 3; colIdx < row.length; colIdx++) {
@@ -101,93 +111,54 @@ function extractGroupSchedule(filePath, targetGroup) {
     }
 
     if (groupColIndex === -1) {
-      throw new Error(`Группа "${targetGroup}" не найдена в файле`);
+      throw new Error(`Группа "${targetGroup}" не найдена`);
     }
 
     const result = [];
 
-    // 🔁 Проходим по ВСЕМ строкам, начиная с 1 (пропускаем шапку, если есть)
     for (let rowIdx = 1; rowIdx < data.length; rowIdx++) {
       const row = data[rowIdx] || [];
-      
-      const weekCell = row[0] ? String(row[0]).trim() : "";
-      const dayCell = row[1] ? String(row[1]).trim() : "";
-      const numberCell = row[2] ? String(row[2]).trim() : "";
-      const subjectCell = row[groupColIndex] ? String(row[groupColIndex]).trim() : "";
+      const week = (row[0] ? String(row[0]).trim() : "") || findLastValue(data, 0, rowIdx);
+      const day = (row[1] ? String(row[1]).trim() : "") || findLastValue(data, 1, rowIdx);
+      const number = (row[2] ? String(row[2]).trim() : "") || findLastValue(data, 2, rowIdx);
+      const subject = row[groupColIndex] ? String(row[groupColIndex]).trim() : "";
 
-      // ✅ Пропускаем, если и предмета нет, и нет данных для привязки
-      if (!subjectCell) continue;
-
-      // 🟡 Пытаемся сохранить контекст: если week/day/number пустые — ищем выше
-      let week = weekCell;
-      let day = dayCell;
-      let number = numberCell;
-
-      // Если текущая строка не содержит день/неделю/номер — ищем последнее непустое значение выше
-      if (!week) {
-        for (let i = rowIdx - 1; i >= 0; i--) {
-          const w = data[i]?.[0];
-          if (w) {
-            week = String(w).trim();
-            break;
-          }
-        }
-      }
-      if (!day) {
-        for (let i = rowIdx - 1; i >= 0; i--) {
-          const d = data[i]?.[1];
-          if (d) {
-            day = String(d).trim();
-            break;
-          }
-        }
-      }
-      if (!number) {
-        for (let i = rowIdx - 1; i >= 0; i--) {
-          const n = data[i]?.[2];
-          if (n) {
-            number = String(n).trim();
-            break;
-          }
-        }
-      }
-
-      // ✅ Только если есть предмет и хотя бы день — добавляем
-      if (subjectCell && (day || week)) {
-        result.push({
-          week: week || "—",
-          day: day || "—",
-          number: number || "—",
-          subject: subjectCell,
-        });
+      if (subject && (week || day)) {
+        result.push({ week, day, number, subject });
       }
     }
 
     if (result.length === 0) {
-      throw new Error(`Расписание для группы "${targetGroup}" найдено, но предметы не обнаружены`);
+      throw new Error(`Расписание для "${targetGroup}" найдено, но предметы не обнаружены`);
     }
 
     return result;
   } catch (err) {
-    console.error("❌ Ошибка при обработке Excel:", err.message);
+    console.error("❌ Ошибка обработки Excel:", err.message);
     throw err;
   }
+}
+
+// Вспомогательная функция: найти последнее непустое значение выше
+function findLastValue(data, col, fromRow) {
+  for (let i = fromRow - 1; i >= 0; i--) {
+    if (data[i]?.[col]) return String(data[i][col]).trim();
+  }
+  return "";
 }
 
 // === API ===
 app.post('/api/schedule', async (req, res) => {
   const { group } = req.body;
 
-  if (!group) {
-    return res.status(400).json({ error: 'Не указана группа' });
+  if (!group || !group.trim()) {
+    return res.status(400).json({ success: false, error: 'Не указана группа' });
   }
 
   try {
     const link = await findScheduleLink();
-    const filePath = await downloadFile(link);
-    const schedule = await extractGroupSchedule(filePath, group.trim());
+    const schedule = await fetchAndParseExcel(link, group.trim());
 
-    // Отправляем JSON
     res.json({
       success: true,
       schedule,
@@ -202,18 +173,18 @@ app.post('/api/schedule', async (req, res) => {
   }
 });
 
-// === Автообновление каждые 6 часов ===
-cron.schedule('0 */6 * * *', async () => {
-  console.log('⏰ Автообновление расписания...');
-  try {
-    const link = await findScheduleLink();
-    const filePath = await downloadFile(link);
-    console.log(`✅ Автообновление: скачано ${path.basename(filePath)}`);
-  } catch (err) {
-    console.error('❌ Ошибка автообновления:', err.message);
-  }
-});
+// ✅ Исправление 4: Cron — можно оставить, но знай: на бесплатном Render может "спать"
+// cron.schedule('0 */6 * * *', async () => {
+//   console.log('⏰ Проверка обновлений...');
+//   try {
+//     const link = await findScheduleLink();
+//     console.log(`✅ Актуальная ссылка: ${link}`);
+//   } catch (err) {
+//     console.error('❌ Ошибка:', err.message);
+//   }
+// });
 
+// ✅ Запуск сервера
 app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
 });
