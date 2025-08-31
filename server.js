@@ -6,11 +6,8 @@ const XLSX = require('xlsx');
 
 const app = express();
 
-// ✅ Используем PORT из Render
+// ✅ Порт и кеширование
 const PORT = process.env.PORT || 10000;
-
-
-// 🔽 ГЛОБАЛЬНЫЙ КЕШ
 let cachedSchedule = null;
 let lastUpdated = null;
 
@@ -18,25 +15,22 @@ let lastUpdated = null;
 app.use(cors());
 app.use(express.json());
 
-// ✅ Гарантируем, что сервер слушает 0.0.0.0 (требование Render)
+// ✅ Слушаем 0.0.0.0 — обязательно для Render
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  console.log(`🌐 Доступ: https://sever-on8d.onrender.com`);
 });
 
 // ✅ Главная страница
 app.get('/', (req, res) => {
   res.send(`
     <h1>📚 Сервер расписания РГАТУ</h1>
-    <p><a href="/api/schedule">GET /api/schedule</a> — получить всё расписание</p>
-    <p>Кеш: ${cachedSchedule ? 'включён' : 'ожидает загрузки'}</p>
+    <p>GET <a href="/api/schedule">/api/schedule</a> — получить всё расписание</p>
   `);
 });
 
-// ✅ API: получение расписания
+// ✅ API
 app.get('/api/schedule', async (req, res) => {
   if (cachedSchedule) {
-    console.log('✅ Отдаём из кеша');
     return res.json({
       success: true,
       schedule: cachedSchedule,
@@ -64,51 +58,60 @@ app.get('/api/schedule', async (req, res) => {
   }
 });
 
-// ✅ Функция с полной подделкой
+// ✅ Функция с ПОЛНОЙ имитацией реального запроса
 async function fetchFullSchedule() {
   const MAX_RETRIES = 3;
-  const TIMEOUT = 45000; // 45 сек
+  const TIMEOUT = 45000;
 
-  // 🇷🇺 Список доверенных российских IP (Мегафон, МТС, Билайн)
+  // 🔥 Реальные заголовки с сайта РГАТУ (из твоего лога)
+  const REAL_HEADERS = {
+    'accept': '*/*',
+    'accept-encoding': 'gzip, deflate, br, zstd',
+    'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7',
+    'origin': 'https://www.rsatu.ru',
+    'referer': 'https://www.rsatu.ru/',
+    'sec-ch-ua': '"Not;A=Brand";v="99", "Microsoft Edge";v="139", "Chromium";v="139"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'no-cors',
+    'sec-fetch-site': 'cross-site',
+    'sec-fetch-storage-access': 'active',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
+    'priority': 'u=4, i',
+
+    // 🔽 Дополним для полной легитимности
+    'connection': 'keep-alive',
+    'upgrade-insecure-requests': '1',
+    'cache-control': 'no-cache',
+  };
+
+  // 🇷🇺 Поддельный российский IP (из твоего лога — yandex)
   const RUSSIAN_IPS = [
-    '46.226.160.240',  // Мегафон
-    '95.108.200.1',    // МТС
-    '178.154.240.1',   // Beeline
-    '176.195.100.100', // Rostelecom
-    '93.186.200.1'     // Вымпелком
+    '46.226.160.240', '95.108.200.1', '178.154.240.1', '176.195.100.100'
   ];
-
-  // Выбираем случайный российский IP
   const fakeIp = RUSSIAN_IPS[Math.floor(Math.random() * RUSSIAN_IPS.length)];
+
+  // 🔽 Добавим поддельные заголовки
+  const headers = {
+    ...REAL_HEADERS,
+    'x-forwarded-for': fakeIp,
+    'x-real-ip': fakeIp,
+    'true-client-ip': fakeIp,
+    'cf-connecting-ip': fakeIp,
+  };
+
+  const FALLBACK_EXCEL_URL = 'https://www.rsatu.ru/upload/files/raspisanie.xlsx';
+  const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      console.log(`🔍 Попытка ${attempt}: запрос с поддельным IP ${fakeIp}`);
-
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Ru) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'ru-RU,ru;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer': 'https://www.yandex.ru/',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-
-        // 🔥 Поддельные заголовки — имитация российского клиента
-        'X-Forwarded-For': fakeIp,
-        'X-Real-IP': fakeIp,
-        'CF-Connecting-IP': fakeIp, // если думает, что за Cloudflare
-        'True-Client-IP': fakeIp
-      };
-
-      let htmlUrl = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
-      let excelUrl = null;
+      console.log(`🔍 Попытка ${attempt} с IP ${fakeIp}`);
 
       // 🔎 Парсим HTML
+      let excelUrl = null;
       try {
-        const response = await axios.get(htmlUrl, {
+        const response = await axios.get(SCHEDULE_PAGE_URL, {
           headers,
           timeout: TIMEOUT
         });
@@ -118,7 +121,7 @@ async function fetchFullSchedule() {
           const href = $(el).attr('href');
           if (href && (href.includes('.xlsx') || href.includes('.xls'))) {
             try {
-              excelUrl = new URL(href, htmlUrl).href;
+              excelUrl = new URL(href, SCHEDULE_PAGE_URL).href;
               return false; // break
             } catch (e) {
               console.warn('❌ Невалидная ссылка:', href);
@@ -129,9 +132,9 @@ async function fetchFullSchedule() {
         console.warn(`⚠️ Не удалось распарсить HTML:`, err.message);
       }
 
-      // 🔽 Если не нашли — используем fallback
       if (!excelUrl) {
-        console.warn('⚠️ Ссылка не найдена...');
+        console.warn('⚠️ Ссылка не найдена → используем fallback');
+        excelUrl = FALLBACK_EXCEL_URL;
       }
 
       console.log('📥 Скачивание Excel:', excelUrl);
@@ -139,7 +142,8 @@ async function fetchFullSchedule() {
         responseType: 'arraybuffer',
         headers: {
           ...headers,
-          'Referer': htmlUrl
+          'referer': SCHEDULE_PAGE_URL,
+          'accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*'
         },
         timeout: 60000
       });
@@ -149,7 +153,6 @@ async function fetchFullSchedule() {
       const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
 
       const result = [];
-
       for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
         const row = jsonData[rowIdx] || [];
         const week = (row[0] ? String(row[0]).trim() : "") || findLast(jsonData, 0, rowIdx);
@@ -158,7 +161,7 @@ async function fetchFullSchedule() {
 
         for (let colIdx = 3; colIdx < row.length; colIdx++) {
           const subject = row[colIdx] ? String(row[colIdx]).trim() : "";
-          if (subject && !subject.includes("undefined") && subject.length > 1) {
+          if (subject && subject.length > 1 && !subject.includes("undefined")) {
             result.push({
               week, day, number, subject,
               group: extractGroup(subject)
@@ -171,14 +174,12 @@ async function fetchFullSchedule() {
     } catch (err) {
       console.error(`❌ Попытка ${attempt} не удалась:`, err.message);
       if (attempt === MAX_RETRIES) throw err;
-
-      // Пауза: 3, 6, 9 сек
       await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
     }
   }
 }
 
-// 🔧 Вспомогательные функции
+// 🔧 Вспомогательные
 function findLast(data, col, from) {
   for (let i = from - 1; i >= 0; i--) if (data[i]?.[col]) return data[i][col].toString().trim();
   return "";
