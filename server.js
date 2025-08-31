@@ -2,168 +2,119 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
 const XLSX = require('xlsx');
-const cron = require('node-cron');
 
 const app = express();
 
-// ✅ Исправление 1: Динамический PORT
-const PORT = process.env.PORT || 5000;
+// ✅ Используем PORT из окружения
+const PORT = process.env.PORT || 10000;
 
-// ✅ Исправление 2: Убраны пробелы в URL
-const BASE_URL = 'https://www.rsatu.ru';
-const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
-const TARGET_LINK_TEXT = 'Расписание занятий';
-
-// ❌ Убираем сохранение в ./downloads — Render не сохранит файлы
-// const DOWNLOAD_DIR = './downloads';
-// if (!fs.existsSync(DOWNLOAD_DIR)) {
-//   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-// }
-
+// ✅ Парсим JSON (на будущее)
 app.use(cors());
 app.use(express.json());
 
-// ✅ Исправление 3: Простой маршрут для проверки
-app.get('/', (req, res) => {
-  res.send(`
-    <h1>🚀 Сервер расписания РГАТУ</h1>
-    <p>Готов к работе. Используй <code>POST /api/schedule</code></p>
-  `);
-});
+// 🔽 ГЛОБАЛЬНЫЙ КЕШ
+let cachedSchedule = null;
+let lastUpdated = null;
 
-// === ПАРСИНГ ССЫЛКИ ===
-async function findScheduleLink() {
+// ✅ Функция загрузки и обработки Excel
+async function fetchFullSchedule() {
+  const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
+  const TARGET_LINK_TEXT = 'Расписание занятий';
+
   try {
-    const response = await axios.get(SCHEDULE_PAGE_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+    console.log('🔍 Парсинг страницы РГАТУ...');
+    const { data } = await axios.get(SCHEDULE_PAGE_URL, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible)' },
+      timeout: 15000
     });
 
-    const $ = cheerio.load(response.data);
-    const links = [];
+    const $ = cheerio.load(data);
+    let excelUrl = null;
 
     $('a').each((i, el) => {
-      const text = $(el).text().trim();
       const href = $(el).attr('href');
-      if (!href) return;
-
-      // Правильный fullUrl
-      let fullUrl;
-      try {
-        fullUrl = new URL(href, SCHEDULE_PAGE_URL).href;
-      } catch (err) {
-        return; // пропускаем битые ссылки
-      }
-
-      if (
-        text.includes(TARGET_LINK_TEXT) ||
-        text.toLowerCase().includes('расписание') ||
-        href.includes('.xlsx')
-      ) {
-        links.push({ text, href, fullUrl });
+      if (href && (href.includes('.xlsx') || href.includes('.xls'))) {
+        excelUrl = new URL(href, SCHEDULE_PAGE_URL).href;
+        return false; // break
       }
     });
 
-    if (links.length === 0) throw new Error('Ссылка на расписание не найдена');
+    if (!excelUrl) throw new Error('Ссылка на Excel не найдена');
 
-    // Приоритет: .xlsx
-    const excelLink = links.find(l => l.fullUrl.includes('.xlsx'));
-    return (excelLink || links[0]).fullUrl;
-  } catch (err) {
-    console.error('❌ Парсинг ссылки:', err.message);
-    throw err;
-  }
-}
-
-// === СКАЧИВАНИЕ И ОБРАБОТКА В ПАМЯТИ (без сохранения на диск) ===
-async function fetchAndParseExcel(url, targetGroup) {
-  try {
-    const response = await axios.get(url, {
+    console.log('📥 Скачивание Excel...');
+    const fileRes = await axios.get(excelUrl, {
       responseType: 'arraybuffer',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': SCHEDULE_PAGE_URL
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible)' }
     });
 
-    // ✅ Читаем Excel из памяти (без fs!)
-    const workbook = XLSX.read(response.data, { type: 'buffer' });
+    const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-
-    let groupColIndex = -1;
-
-    // Поиск колонки с группой
-    for (let rowIdx = 0; rowIdx < Math.min(data.length, 20); rowIdx++) {
-      const row = data[rowIdx] || [];
-      for (let colIdx = 3; colIdx < row.length; colIdx++) {
-        const cell = String(row[colIdx]).trim();
-        if (cell.toUpperCase() === targetGroup.toUpperCase()) {
-          groupColIndex = colIdx;
-          break;
-        }
-      }
-      if (groupColIndex !== -1) break;
-    }
-
-    if (groupColIndex === -1) {
-      throw new Error(`Группа "${targetGroup}" не найдена`);
-    }
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
 
     const result = [];
 
-    for (let rowIdx = 1; rowIdx < data.length; rowIdx++) {
-      const row = data[rowIdx] || [];
-      const week = (row[0] ? String(row[0]).trim() : "") || findLastValue(data, 0, rowIdx);
-      const day = (row[1] ? String(row[1]).trim() : "") || findLastValue(data, 1, rowIdx);
-      const number = (row[2] ? String(row[2]).trim() : "") || findLastValue(data, 2, rowIdx);
-      const subject = row[groupColIndex] ? String(row[groupColIndex]).trim() : "";
+    // 🔁 Проход по всем строкам
+    for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
+      const row = jsonData[rowIdx] || [];
+      const week = row[0]?.toString().trim() || findLast(data, 0, rowIdx);
+      const day = row[1]?.toString().trim() || findLast(data, 1, rowIdx);
+      const number = row[2]?.toString().trim() || findLast(data, 2, rowIdx);
 
-      if (subject && (week || day)) {
-        result.push({ week, day, number, subject });
+      // Собираем все группы (столбцы D+)
+      for (let colIdx = 3; colIdx < row.length; colIdx++) {
+        const subject = row[colIdx]?.toString().trim();
+        if (subject && subject.length > 1 && !subject.includes("undefined")) {
+          result.push({
+            week, day, number, subject,
+            group: extractGroupName(subject) // попробуем вытащить группу из строки
+          });
+        }
       }
-    }
-
-    if (result.length === 0) {
-      throw new Error(`Расписание для "${targetGroup}" найдено, но предметы не обнаружены`);
     }
 
     return result;
   } catch (err) {
-    console.error("❌ Ошибка обработки Excel:", err.message);
+    console.error('❌ Ошибка загрузки:', err.message);
     throw err;
   }
 }
 
-// Вспомогательная функция: найти последнее непустое значение выше
-function findLastValue(data, col, fromRow) {
-  for (let i = fromRow - 1; i >= 0; i--) {
-    if (data[i]?.[col]) return String(data[i][col]).trim();
-  }
+// Вспомогательные функции
+function findLast(data, col, from) {
+  for (let i = from - 1; i >= 0; i--) if (data[i]?.[col]) return data[i][col].toString().trim();
   return "";
 }
 
-// === API ===
-app.post('/api/schedule', async (req, res) => {
-  const { group } = req.body;
+function extractGroupName(cell) {
+  // Простой пример: если есть "ИПБ-24", возвращаем
+  const match = cell.match(/[А-Я]{2,4}-\d{2,3}/);
+  return match ? match[0] : "unknown";
+}
 
-  if (!group || !group.trim()) {
-    return res.status(400).json({ success: false, error: 'Не указана группа' });
+// ✅ Единый GET-эндпоинт
+app.get('/api/schedule', async (req, res) => {
+  if (cachedSchedule) {
+    console.log('✅ Отдаём из кеша');
+    return res.json({
+      success: true,
+      schedule: cachedSchedule,
+      lastUpdated,
+      fromCache: true
+    });
   }
 
   try {
-    const link = await findScheduleLink();
-    const schedule = await fetchAndParseExcel(link, group.trim());
+    const schedule = await fetchFullSchedule();
+    cachedSchedule = schedule;
+    lastUpdated = new Date().toISOString();
 
+    console.log('✅ Новые данные загружены');
     res.json({
       success: true,
       schedule,
-      lastUpdated: new Date().toISOString(),
-      source: link
+      lastUpdated,
+      fromCache: false
     });
   } catch (err) {
     res.status(500).json({
@@ -173,18 +124,15 @@ app.post('/api/schedule', async (req, res) => {
   }
 });
 
-// ✅ Исправление 4: Cron — можно оставить, но знай: на бесплатном Render может "спать"
-// cron.schedule('0 */6 * * *', async () => {
-//   console.log('⏰ Проверка обновлений...');
-//   try {
-//     const link = await findScheduleLink();
-//     console.log(`✅ Актуальная ссылка: ${link}`);
-//   } catch (err) {
-//     console.error('❌ Ошибка:', err.message);
-//   }
-// });
+// ✅ Для проверки
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>📚 Сервер расписания РГАТУ</h1>
+    <p>GET <a href="/api/schedule">/api/schedule</a> — получить всё расписание</p>
+    <p>Кеш: ${cachedSchedule ? 'да' : 'нет'}</p>
+  `);
+});
 
-// ✅ Запуск сервера
 app.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
 });
