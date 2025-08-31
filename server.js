@@ -101,7 +101,7 @@ async function fetchFullSchedule() {
     'cf-connecting-ip': fakeIp,
   };
 
-  const FALLBACK_EXCEL_URL = 'https://www.rsatu.ru/upload/files/raspisanie.xlsx';
+  const FALLBACK_EXCEL_URL = 'https://www.rsatu.ru/upload/iblock/eb9/vlau1arz17xoo9n7g07lf1grd2e8etw0/Raspisanie-29.08.25.xlsx';
   const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
