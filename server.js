@@ -20,63 +20,91 @@ let lastUpdated = null;
 // ✅ Функция загрузки и обработки Excel
 async function fetchFullSchedule() {
   const SCHEDULE_PAGE_URL = 'https://www.rsatu.ru/students/raspisanie-zanyatiy/';
-  const TARGET_LINK_TEXT = 'Расписание занятий';
+  const MAX_RETRIES = 3;
+  const TIMEOUT = 30000; // 30 секунд
 
-  try {
-    console.log('🔍 Парсинг страницы РГАТУ...');
-    const { data } = await axios.get(SCHEDULE_PAGE_URL, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible)' },
-      timeout: 15000
-    });
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`🔍 Парсинг страницы РГАТУ... Попытка ${attempt}`);
 
-    const $ = cheerio.load(data);
-    let excelUrl = null;
+      const { data } = await axios.get(SCHEDULE_PAGE_URL, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Referer': 'https://www.rsatu.ru/',
+          'Connection': 'keep-alive',
+        },
+        timeout: TIMEOUT,
+        // ⚠️ Важно: если Render блокирует внешние DNS, может помочь
+        // httpAgent: new (require('http').Agent)({ keepAlive: true })
+      });
 
-    $('a').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href && (href.includes('.xlsx') || href.includes('.xls'))) {
-        excelUrl = new URL(href, SCHEDULE_PAGE_URL).href;
-        return false; // break
+      const $ = cheerio.load(data);
+      let excelUrl = null;
+
+      $('a').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href && (href.includes('.xlsx') || href.includes('.xls'))) {
+          try {
+            excelUrl = new URL(href, SCHEDULE_PAGE_URL).href;
+            return false; // break
+          } catch (e) {
+            console.warn('Invalid URL:', href);
+          }
+        }
+      });
+
+      if (!excelUrl) {
+        throw new Error('Ссылка на Excel не найдена на странице');
       }
-    });
 
-    if (!excelUrl) throw new Error('Ссылка на Excel не найдена');
+      console.log('📥 Скачивание Excel-файла...');
+      const fileRes = await axios.get(excelUrl, {
+        responseType: 'arraybuffer',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': SCHEDULE_PAGE_URL
+        },
+        timeout: 45000 // больше времени на скачивание
+      });
 
-    console.log('📥 Скачивание Excel...');
-    const fileRes = await axios.get(excelUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible)' }
-    });
+      const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
 
-    const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      const result = [];
 
-    const result = [];
+      for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
+        const row = jsonData[rowIdx] || [];
+        const week = row[0]?.toString().trim() || findLast(jsonData, 0, rowIdx);
+        const day = row[1]?.toString().trim() || findLast(jsonData, 1, rowIdx);
+        const number = row[2]?.toString().trim() || findLast(jsonData, 2, rowIdx);
 
-    // 🔁 Проход по всем строкам
-    for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
-      const row = jsonData[rowIdx] || [];
-      const week = row[0]?.toString().trim() || findLast(data, 0, rowIdx);
-      const day = row[1]?.toString().trim() || findLast(data, 1, rowIdx);
-      const number = row[2]?.toString().trim() || findLast(data, 2, rowIdx);
-
-      // Собираем все группы (столбцы D+)
-      for (let colIdx = 3; colIdx < row.length; colIdx++) {
-        const subject = row[colIdx]?.toString().trim();
-        if (subject && subject.length > 1 && !subject.includes("undefined")) {
-          result.push({
-            week, day, number, subject,
-            group: extractGroupName(subject) // попробуем вытащить группу из строки
-          });
+        for (let colIdx = 3; colIdx < row.length; colIdx++) {
+          const subject = row[colIdx]?.toString().trim();
+          if (subject && subject.length > 1 && !subject.includes("undefined")) {
+            result.push({
+              week, day, number, subject,
+              group: extractGroupName(subject)
+            });
+          }
         }
       }
-    }
 
-    return result;
-  } catch (err) {
-    console.error('❌ Ошибка загрузки:', err.message);
-    throw err;
+      console.log(`✅ Успешно загружено: ${result.length} строк`);
+      return result;
+
+    } catch (err) {
+      console.error(`❌ Попытка ${attempt} не удалась:`, err.message);
+
+      if (attempt === MAX_RETRIES) {
+        throw new Error(`Не удалось загрузить расписание после ${MAX_RETRIES} попыток: ${err.message}`);
+      }
+
+      // Пауза перед повторной попыткой
+      await new Promise(resolve => setTimeout(resolve, 3000 * attempt)); // 3, 6, 9 сек
+    }
   }
 }
 
