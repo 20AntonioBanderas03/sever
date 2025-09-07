@@ -35,8 +35,6 @@ app.get('/', (req, res) => {
   res.send(`
     <h1>📚 Сервер расписания РГАТУ</h1>
     <p><a href="/api/schedule">GET /api/schedule</a> — получить расписание</p>
-    <p><a href="/schedule-ui">GET /schedule-ui</a> — расписание UI</p>
-    <p><a href="/api/upload-schedule">POST /api/upload-schedule</a> — загрузить Excel-файл</p>
     <p><a href="/load-schedule">/load-schedule</a> — загрузить расписание по ссылке</p>
     <p>Кеш: ${cachedSchedule ? 'включён' : 'ожидает'}</p>
     <p>Последнее обновление: ${lastUpdated || 'никогда'}</p>
